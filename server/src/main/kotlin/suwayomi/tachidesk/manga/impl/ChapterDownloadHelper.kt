@@ -9,18 +9,22 @@ import suwayomi.tachidesk.manga.impl.download.fileProvider.ChaptersFilesProvider
 import suwayomi.tachidesk.manga.impl.download.fileProvider.impl.ArchiveProvider
 import suwayomi.tachidesk.manga.impl.download.fileProvider.impl.FolderProvider
 import suwayomi.tachidesk.manga.impl.download.model.DownloadQueueItem
+import suwayomi.tachidesk.manga.impl.download.storage.DownloadStorageFactory
+import suwayomi.tachidesk.manga.impl.download.storage.StoragePaths
 import suwayomi.tachidesk.manga.impl.util.getChapterCbzPath
 import suwayomi.tachidesk.manga.impl.util.getChapterDownloadPath
 import suwayomi.tachidesk.manga.model.dataclass.ChapterDataClass
 import suwayomi.tachidesk.manga.model.table.ChapterTable
 import suwayomi.tachidesk.manga.model.table.MangaTable
 import suwayomi.tachidesk.manga.model.table.toDataClass
+import suwayomi.tachidesk.server.ApplicationDirs
 import suwayomi.tachidesk.server.serverConfig
+import uy.kohesive.injekt.injectLazy
 import xyz.nulldev.androidcompat.util.SafePath
-import java.io.File
 import java.io.InputStream
 
 object ChapterDownloadHelper {
+    private val applicationDirs: ApplicationDirs by injectLazy()
     suspend fun getImage(
         mangaId: Int,
         chapterId: Int,
@@ -48,16 +52,19 @@ object ChapterDownloadHelper {
         step: suspend (DownloadQueueItem?, Boolean) -> Unit,
     ): Boolean = provider(mangaId, chapterId).download().execute(download, scope, step)
 
-    // return the appropriate provider based on how the download was saved. For the logic is simple but will evolve when new types of downloads are available
+    // return the appropriate provider based on how the download was saved
     private suspend fun provider(
         mangaId: Int,
         chapterId: Int,
     ): ChaptersFilesProvider<*> {
-        val chapterFolder = File(getChapterDownloadPath(mangaId, chapterId))
-        val cbzFile = File(getChapterCbzPath(mangaId, chapterId))
-        if (cbzFile.exists()) return ArchiveProvider(mangaId, chapterId)
-        if (!chapterFolder.exists() && serverConfig.downloadAsCbz.value) return ArchiveProvider(mangaId, chapterId)
-        return FolderProvider(mangaId, chapterId)
+        val storage = DownloadStorageFactory.create()
+
+        val cbzPath = StoragePaths.toStorageRelative(getChapterCbzPath(mangaId, chapterId), applicationDirs.downloadsRoot)
+        val folderPath = StoragePaths.toStorageRelative(getChapterDownloadPath(mangaId, chapterId), applicationDirs.downloadsRoot)
+
+        if (storage.exists(cbzPath)) return ArchiveProvider(mangaId, chapterId, storage)
+        if (!storage.exists(folderPath) && serverConfig.downloadAsCbz.value) return ArchiveProvider(mangaId, chapterId, storage)
+        return FolderProvider(mangaId, chapterId, storage)
     }
 
     suspend fun getArchiveStreamWithSize(

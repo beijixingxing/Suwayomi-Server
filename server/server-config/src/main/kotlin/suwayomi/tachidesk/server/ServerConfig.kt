@@ -28,6 +28,7 @@ import org.jetbrains.exposed.v1.core.SortOrder
 import suwayomi.tachidesk.graphql.types.AuthMode
 import suwayomi.tachidesk.graphql.types.CbzMediaType
 import suwayomi.tachidesk.graphql.types.DatabaseType
+import suwayomi.tachidesk.graphql.types.DownloadStorageType
 import suwayomi.tachidesk.graphql.types.DownloadConversion
 import suwayomi.tachidesk.graphql.types.KoreaderSyncChecksumMethod
 import suwayomi.tachidesk.graphql.types.KoreaderSyncConflictStrategy
@@ -231,6 +232,47 @@ class ServerConfig(
         privacySafe = false,
         defaultValue = "",
         mustExist = true,
+        excludeFromBackup = true,
+    )
+
+    val downloadStorageType: MutableStateFlow<DownloadStorageType> by EnumSetting(
+        protoNumber = 99,
+        group = SettingGroup.DOWNLOADER,
+        privacySafe = true,
+        defaultValue = DownloadStorageType.LOCAL,
+        enumClass = DownloadStorageType::class,
+        typeInfo = SettingsRegistry.PartialTypeInfo(imports = listOf("suwayomi.tachidesk.graphql.types.DownloadStorageType")),
+    )
+
+    val webdavUrl: MutableStateFlow<String> by StringSetting(
+        protoNumber = 100,
+        group = SettingGroup.DOWNLOADER,
+        privacySafe = false,
+        defaultValue = "",
+        excludeFromBackup = true,
+    )
+
+    val webdavUsername: MutableStateFlow<String> by StringSetting(
+        protoNumber = 101,
+        group = SettingGroup.DOWNLOADER,
+        privacySafe = false,
+        defaultValue = "",
+        excludeFromBackup = true,
+    )
+
+    val webdavPassword: MutableStateFlow<String> by StringSetting(
+        protoNumber = 102,
+        group = SettingGroup.DOWNLOADER,
+        privacySafe = false,
+        defaultValue = "",
+        excludeFromBackup = true,
+    )
+
+    val webdavRemotePath: MutableStateFlow<String> by StringSetting(
+        protoNumber = 103,
+        group = SettingGroup.DOWNLOADER,
+        privacySafe = false,
+        defaultValue = "",
         excludeFromBackup = true,
     )
 

@@ -7,9 +7,9 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.jetbrains.exposed.v1.jdbc.update
 import suwayomi.tachidesk.manga.impl.download.fileProvider.ChaptersFilesProvider
 import suwayomi.tachidesk.manga.impl.download.fileProvider.FileType.RegularFile
-import suwayomi.tachidesk.manga.impl.util.getChapterCachePath
+import suwayomi.tachidesk.manga.impl.download.storage.DownloadStorage
+import suwayomi.tachidesk.manga.impl.download.storage.StoragePaths
 import suwayomi.tachidesk.manga.impl.util.getChapterDownloadPath
-import suwayomi.tachidesk.manga.impl.util.storage.FileDeletionHelper
 import suwayomi.tachidesk.manga.model.table.ChapterUserTable
 import suwayomi.tachidesk.server.ApplicationDirs
 import uy.kohesive.injekt.injectLazy
@@ -29,15 +29,17 @@ private val applicationDirs: ApplicationDirs by injectLazy()
 class FolderProvider(
     mangaId: Int,
     chapterId: Int,
+    private val storage: DownloadStorage,
 ) : ChaptersFilesProvider<RegularFile>(mangaId, chapterId) {
-    override suspend fun getImageFiles(): List<RegularFile> {
-        val chapterFolder = File(getChapterDownloadPath(mangaId, chapterId))
+    private suspend fun chapterStoragePath(): String =
+        StoragePaths.toStorageRelative(getChapterDownloadPath(mangaId, chapterId), applicationDirs.downloadsRoot)
 
-        if (!chapterFolder.exists()) {
+    override suspend fun getImageFiles(): List<RegularFile> {
+        val localDir = downloadFolderToLocal()
+        if (localDir == null || !localDir.isDirectory) {
             throw NoSuchElementException("download folder does not exist")
         }
-
-        return chapterFolder
+        return localDir
             .listFiles()
             .orEmpty()
             .toList()
@@ -51,36 +53,26 @@ class FolderProvider(
     }
 
     override suspend fun handleSuccessfulDownload() {
-        val chapterDir = getChapterDownloadPath(mangaId, chapterId)
-        val folder = File(chapterDir)
-
-        val cacheChapterDir = getChapterCachePath(mangaId, chapterId)
-        File(cacheChapterDir).copyRecursively(folder, true)
+        val sourceFolder = resolveSourceFolder() ?: return
+        uploadFolderToStorage(sourceFolder, chapterStoragePath())
     }
 
     override suspend fun delete(): Boolean {
-        val chapterDirPath = getChapterDownloadPath(mangaId, chapterId)
-        val chapterDir = File(chapterDirPath)
-        if (!chapterDir.exists()) {
-            return true
-        }
-
-        val chapterDirDeleted = chapterDir.deleteRecursively()
-        if (chapterDirDeleted) {
+        val deleted = storage.deleteDirectory(chapterStoragePath())
+        if (deleted) {
             transaction {
                 ChapterUserTable.update({ ChapterUserTable.chapter eq chapterId }) {
                     it[koreaderHash] = null
                 }
             }
         }
-        FileDeletionHelper.cleanupParentFoldersFor(chapterDir, applicationDirs.mangaDownloadsRoot)
-        return chapterDirDeleted
+        return deleted
     }
 
     override suspend fun getAsArchiveStream(): Pair<InputStream, Long> {
-        val chapterDir = File(getChapterDownloadPath(mangaId, chapterId))
-
-        if (!chapterDir.exists() || !chapterDir.isDirectory || chapterDir.listFiles().isNullOrEmpty()) {
+        val localDir = downloadFolderToLocal()
+            ?: throw IllegalArgumentException("Invalid folder to create CBZ for chapter ID: $chapterId")
+        if (!localDir.isDirectory || localDir.listFiles().isNullOrEmpty()) {
             throw IllegalArgumentException("Invalid folder to create CBZ for chapter ID: $chapterId")
         }
 
@@ -89,7 +81,7 @@ class FolderProvider(
             zipOutputStream.setMethod(ZipArchiveOutputStream.DEFLATED)
             zipOutputStream.setLevel(Deflater.DEFAULT_COMPRESSION)
 
-            chapterDir
+            localDir
                 .listFiles()
                 ?.filter { it.isFile }
                 ?.sortedBy { it.name }
@@ -109,9 +101,41 @@ class FolderProvider(
     }
 
     override suspend fun getArchiveSize(): Long {
-        val chapterDir = File(getChapterDownloadPath(mangaId, chapterId))
-        if (!chapterDir.exists() || !chapterDir.isDirectory) return 0L
-        // Approximation: actual CBZ size is slightly larger due to ZIP metadata, but sufficient for Content-Length header.
-        return chapterDir.listFiles()?.filter { it.isFile }?.sumOf { it.length() } ?: 0L
+        val files = storage.listFiles(chapterStoragePath())
+        return files.filter { !it.isDirectory }.sumOf { it.size }
+    }
+
+    private suspend fun downloadFolderToLocal(): File? {
+        val files = storage.listFiles(chapterStoragePath())
+        if (files.isEmpty()) return null
+
+        val localDir = File.createTempFile("suwayomi-folder-", "").apply { delete(); mkdirs() }
+        for (file in files) {
+            if (file.isDirectory) continue
+            val stream = storage.readFile(file.path) ?: continue
+            val localFile = File(localDir, file.path.substringAfterLast('/'))
+            stream.use { input -> localFile.outputStream().use { output -> input.copyTo(output) } }
+        }
+        return localDir
+    }
+
+    private suspend fun uploadFolderToStorage(
+        localFolder: File,
+        storagePath: String,
+    ) {
+        storage.createDirectory(storagePath)
+        localFolder
+            .listFiles()
+            .orEmpty()
+            .forEach { file ->
+                val childPath = "$storagePath/${file.name}"
+                if (file.isDirectory) {
+                    uploadFolderToStorage(file, childPath)
+                } else {
+                    file.inputStream().use { input ->
+                        storage.writeFile(childPath, input, file.length())
+                    }
+                }
+            }
     }
 }

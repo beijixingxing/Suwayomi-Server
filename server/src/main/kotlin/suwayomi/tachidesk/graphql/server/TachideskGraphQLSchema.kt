@@ -39,6 +39,7 @@ import suwayomi.tachidesk.graphql.mutations.TrackMutation
 import suwayomi.tachidesk.graphql.mutations.UpdateMutation
 import suwayomi.tachidesk.graphql.mutations.UserMutation
 import suwayomi.tachidesk.graphql.mutations.UserSettingsMutation
+import suwayomi.tachidesk.graphql.mutations.WebDavConnectionMutation
 import suwayomi.tachidesk.graphql.mutations.WebviewMutation
 import suwayomi.tachidesk.graphql.queries.BackupQuery
 import suwayomi.tachidesk.graphql.queries.CategoryQuery
@@ -147,6 +148,7 @@ object GraphQLSchemaProvider {
                         TopLevelObject(UpdateMutation()),
                         TopLevelObject(UserMutation()),
                         TopLevelObject(UserSettingsMutation()),
+                        TopLevelObject(WebDavConnectionMutation()),
                         TopLevelObject(WebviewMutation()),
                     ),
                 subscriptions =
