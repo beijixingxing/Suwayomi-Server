@@ -1,5 +1,6 @@
 package suwayomi.tachidesk.manga.impl.download.storage
 
+import io.github.oshai.kotlinlogging.KotlinLogging
 import suwayomi.tachidesk.server.ApplicationDirs
 
 /**
@@ -11,6 +12,8 @@ import suwayomi.tachidesk.server.ApplicationDirs
  * performs that conversion.
  */
 object StoragePaths {
+    private val logger = KotlinLogging.logger {}
+
     /**
      * Converts an absolute local download path into a path relative to the download root.
      * If [absolutePath] is already relative, it is returned unchanged.
@@ -22,10 +25,15 @@ object StoragePaths {
         val root = downloadsRoot.trimEnd('/')
         val normalized = absolutePath.replace('\\', '/')
         val prefix = "$root/"
-        return if (normalized.startsWith(prefix)) {
-            normalized.removePrefix(prefix)
-        } else {
-            normalized.trimStart('/')
+        if (normalized.startsWith(prefix)) {
+            return normalized.removePrefix(prefix)
         }
+        // Not below the download root — fall back to a root-relative path, but make the
+        // misconfiguration visible rather than silently leaking an absolute host path.
+        logger.warn {
+            "Download path '$absolutePath' is not inside the download root '$root'; " +
+                "using a root-relative path instead"
+        }
+        return normalized.trimStart('/')
     }
 }

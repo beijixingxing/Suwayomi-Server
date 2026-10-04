@@ -1,5 +1,9 @@
 package suwayomi.tachidesk.manga.impl.download.fileProvider.impl
 
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.apache.commons.compress.archivers.zip.ZipArchiveEntry
 import org.apache.commons.compress.archivers.zip.ZipArchiveOutputStream
 import org.jetbrains.exposed.v1.core.eq
@@ -8,6 +12,7 @@ import org.jetbrains.exposed.v1.jdbc.update
 import suwayomi.tachidesk.manga.impl.download.fileProvider.ChaptersFilesProvider
 import suwayomi.tachidesk.manga.impl.download.fileProvider.FileType.RegularFile
 import suwayomi.tachidesk.manga.impl.download.storage.DownloadStorage
+import suwayomi.tachidesk.manga.impl.download.storage.RemoteCopyCache
 import suwayomi.tachidesk.manga.impl.download.storage.StoragePaths
 import suwayomi.tachidesk.manga.impl.util.getChapterDownloadPath
 import suwayomi.tachidesk.manga.model.table.ChapterUserTable
@@ -19,6 +24,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
+import java.nio.file.Files
 import java.util.zip.Deflater
 
 private val applicationDirs: ApplicationDirs by injectLazy()
@@ -30,6 +36,11 @@ class FolderProvider(
     mangaId: Int,
     chapterId: Int,
     private val storage: DownloadStorage,
+    /**
+     * Backend the chapter content is actually read from. Defaults to [storage]; differs when a
+     * chapter was downloaded through another backend (e.g. before the storage type was switched).
+     */
+    private val readStorage: DownloadStorage = storage,
 ) : ChaptersFilesProvider<RegularFile>(mangaId, chapterId) {
     private suspend fun chapterStoragePath(): String =
         StoragePaths.toStorageRelative(getChapterDownloadPath(mangaId, chapterId), applicationDirs.downloadsRoot)
@@ -52,14 +63,18 @@ class FolderProvider(
         // nothing to do
     }
 
+    override suspend fun existsInActiveBackend(): Boolean = storage.listFiles(chapterStoragePath()).any { !it.isDirectory }
+
     override suspend fun handleSuccessfulDownload() {
         val sourceFolder = resolveSourceFolder() ?: return
         uploadFolderToStorage(sourceFolder, chapterStoragePath())
     }
 
     override suspend fun delete(): Boolean {
-        val deleted = storage.deleteDirectory(chapterStoragePath())
+        val path = chapterStoragePath()
+        val deleted = storage.deleteDirectory(path)
         if (deleted) {
+            storage.cleanupEmptyParents(path)
             transaction {
                 ChapterUserTable.update({ ChapterUserTable.chapter eq chapterId }) {
                     it[koreaderHash] = null
@@ -70,8 +85,9 @@ class FolderProvider(
     }
 
     override suspend fun getAsArchiveStream(): Pair<InputStream, Long> {
-        val localDir = downloadFolderToLocal()
-            ?: throw IllegalArgumentException("Invalid folder to create CBZ for chapter ID: $chapterId")
+        val localDir =
+            downloadFolderToLocal()
+                ?: throw IllegalArgumentException("Invalid folder to create CBZ for chapter ID: $chapterId")
         if (!localDir.isDirectory || localDir.listFiles().isNullOrEmpty()) {
             throw IllegalArgumentException("Invalid folder to create CBZ for chapter ID: $chapterId")
         }
@@ -101,22 +117,43 @@ class FolderProvider(
     }
 
     override suspend fun getArchiveSize(): Long {
-        val files = storage.listFiles(chapterStoragePath())
+        val files = readStorage.listFiles(chapterStoragePath())
         return files.filter { !it.isDirectory }.sumOf { it.size }
     }
 
+    /**
+     * Makes the chapter folder available as a local directory.
+     *
+     * A local backend is used in place — no copy is made at all, which is what the legacy
+     * filesystem-only code did. Remote backends are materialised into a bounded cache so that
+     * reading a page does not re-download every page of the chapter, without leaking temp
+     * directories over time.
+     */
     private suspend fun downloadFolderToLocal(): File? {
-        val files = storage.listFiles(chapterStoragePath())
+        val storagePath = chapterStoragePath()
+
+        // Fast path: local backend, read the folder in place.
+        readStorage.localPathOrNull(storagePath)?.takeIf { it.isDirectory }?.let { return it }
+
+        val files = readStorage.listFiles(storagePath).filter { !it.isDirectory }
         if (files.isEmpty()) return null
 
-        val localDir = File.createTempFile("suwayomi-folder-", "").apply { delete(); mkdirs() }
-        for (file in files) {
-            if (file.isDirectory) continue
-            val stream = storage.readFile(file.path) ?: continue
-            val localFile = File(localDir, file.path.substringAfterLast('/'))
-            stream.use { input -> localFile.outputStream().use { output -> input.copyTo(output) } }
+        // Cheap change detection: a different page count or total size means the remote content
+        // changed and the cached copy has to be refreshed.
+        val signature = files.size to files.sumOf { it.size }
+
+        return folderCacheMutex.withLock {
+            folderCache.getIfValid(storagePath, signature)?.let { return@withLock it }
+
+            val localDir = withContext(Dispatchers.IO) { Files.createTempDirectory("suwayomi-folder-").toFile() }
+            for (file in files) {
+                val stream = readStorage.readFile(file.path) ?: continue
+                val localFile = File(localDir, file.path.substringAfterLast('/'))
+                stream.use { input -> localFile.outputStream().use { output -> input.copyTo(output) } }
+            }
+            folderCache.put(storagePath, localDir, signature)
+            localDir
         }
-        return localDir
     }
 
     private suspend fun uploadFolderToStorage(
@@ -137,5 +174,12 @@ class FolderProvider(
                     }
                 }
             }
+    }
+
+    companion object {
+        // Bounded cache of chapter folders downloaded from a remote backend, keyed by storage path
+        // and validated by page count + total size. Local backends never touch it.
+        private val folderCache = RemoteCopyCache()
+        private val folderCacheMutex = Mutex()
     }
 }

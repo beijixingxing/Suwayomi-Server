@@ -100,6 +100,15 @@ abstract class ChaptersFilesProvider<Type : FileType>(
     protected abstract suspend fun handleSuccessfulDownload()
 
     /**
+     * Whether the backend downloads are written to already holds this chapter.
+     *
+     * Deliberately ignores any read fallback: content that only exists in a previously used backend
+     * must not make the chapter look downloaded for the active backend, otherwise switching the
+     * storage type and re-downloading would never upload the chapter to the new backend.
+     */
+    protected abstract suspend fun existsInActiveBackend(): Boolean
+
+    /**
      * Resolves the folder containing chapter pages, preferring the download cache and falling back
      * to the local download directory.
      *
@@ -125,10 +134,16 @@ abstract class ChaptersFilesProvider<Type : FileType>(
         step: suspend (DownloadQueueItem?, Boolean) -> Unit,
     ): Boolean {
         val existingDownloadPageCount =
-            try {
-                getImageCount()
-            } catch (_: Exception) {
+            if (!existsInActiveBackend()) {
+                // The chapter may still exist in a previously used backend; treat it as not
+                // downloaded here so the download runs and uploads it to the active backend.
                 0
+            } else {
+                try {
+                    getImageCount()
+                } catch (_: Exception) {
+                    0
+                }
             }
         val pageCount = download.pageCount
 

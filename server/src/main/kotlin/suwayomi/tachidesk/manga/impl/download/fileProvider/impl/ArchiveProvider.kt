@@ -14,6 +14,7 @@ import org.jetbrains.exposed.v1.jdbc.update
 import suwayomi.tachidesk.manga.impl.download.fileProvider.ChaptersFilesProvider
 import suwayomi.tachidesk.manga.impl.download.fileProvider.FileType
 import suwayomi.tachidesk.manga.impl.download.storage.DownloadStorage
+import suwayomi.tachidesk.manga.impl.download.storage.RemoteCopyCache
 import suwayomi.tachidesk.manga.impl.download.storage.StoragePaths
 import suwayomi.tachidesk.manga.impl.util.getChapterCachePath
 import suwayomi.tachidesk.manga.impl.util.getChapterCbzPath
@@ -24,7 +25,6 @@ import suwayomi.tachidesk.server.ApplicationDirs
 import uy.kohesive.injekt.injectLazy
 import java.io.File
 import java.io.InputStream
-import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.Deflater
 
 private val applicationDirs: ApplicationDirs by injectLazy()
@@ -33,6 +33,11 @@ class ArchiveProvider(
     mangaId: Int,
     chapterId: Int,
     private val storage: DownloadStorage,
+    /**
+     * Backend the chapter content is actually read from. Defaults to [storage]; differs when a
+     * chapter was downloaded through another backend (e.g. before the storage type was switched).
+     */
+    private val readStorage: DownloadStorage = storage,
 ) : ChaptersFilesProvider<FileType.ZipFile>(mangaId, chapterId) {
     private suspend fun cbzStoragePath(): String =
         StoragePaths.toStorageRelative(getChapterCbzPath(mangaId, chapterId), applicationDirs.downloadsRoot)
@@ -58,6 +63,8 @@ class ArchiveProvider(
         val localCbz = downloadCbzToLocal() ?: return
         extractCbzFile(localCbz, chapterDownloadFolder)
     }
+
+    override suspend fun existsInActiveBackend(): Boolean = storage.fileSize(cbzStoragePath()) > 0
 
     override suspend fun handleSuccessfulDownload() {
         val mangaDownloadFolder = File(getMangaDownloadDir(mangaId))
@@ -103,8 +110,10 @@ class ArchiveProvider(
     }
 
     override suspend fun delete(): Boolean {
-        val deleted = storage.deleteFile(cbzStoragePath())
+        val path = cbzStoragePath()
+        val deleted = storage.deleteFile(path)
         if (deleted) {
+            storage.cleanupEmptyParents(path)
             transaction {
                 ChapterUserTable.update({ ChapterUserTable.chapter eq chapterId }) {
                     it[koreaderHash] = null
@@ -115,49 +124,49 @@ class ArchiveProvider(
     }
 
     override suspend fun getAsArchiveStream(): Pair<InputStream, Long> {
-        val localCbz = downloadCbzToLocal()
-            ?: throw IllegalArgumentException("CBZ file not found for chapter ID: $chapterId (Manga ID: $mangaId)")
+        val localCbz =
+            downloadCbzToLocal()
+                ?: throw IllegalArgumentException("CBZ file not found for chapter ID: $chapterId (Manga ID: $mangaId)")
         val size = localCbz.length()
         return localCbz.inputStream() to size
     }
 
-    override suspend fun getArchiveSize(): Long = storage.fileSize(cbzStoragePath())
+    override suspend fun getArchiveSize(): Long = readStorage.fileSize(cbzStoragePath())
 
     /**
-     * Downloads the CBZ to a local cache file, reusing a previous copy when the remote
-     * size is unchanged. Reading a chapter page otherwise re-downloads the entire archive
-     * for every page.
+     * Makes the CBZ available as a local file.
+     *
+     * A local backend is used in place — no copy is made at all. For remote backends the archive is
+     * downloaded into a bounded cache so that reading a chapter does not re-download the whole
+     * archive for every page while still not filling the disk over time.
      */
     private suspend fun downloadCbzToLocal(): File? {
         val path = cbzStoragePath()
-        val remoteSize = storage.fileSize(path)
-        if (remoteSize <= 0) return null
 
-        cbzCache[path]?.let { (file, size) ->
-            if (size == remoteSize && file.exists()) return file
-        }
+        // Fast path: local backend, read the file in place.
+        readStorage.localPathOrNull(path)?.takeIf { it.isFile }?.let { return it }
+
+        val remoteSize = readStorage.fileSize(path)
+        if (remoteSize <= 0) return null
 
         return cacheMutex.withLock {
             // double-check after acquiring the lock
-            cbzCache[path]?.let { (file, size) ->
-                if (size == remoteSize && file.exists()) return@withLock file
-            }
+            cbzCache.getIfValid(path, remoteSize)?.let { return@withLock it }
 
-            val stream = storage.readFile(path) ?: return@withLock null
+            val stream = readStorage.readFile(path) ?: return@withLock null
             val cacheFile = File(cbzCacheDir, "${path.hashCode().toUInt()}.cbz")
             withContext(Dispatchers.IO) {
                 stream.use { input -> cacheFile.outputStream().use { output -> input.copyTo(output) } }
             }
-            cacheFile.deleteOnExit()
-            cbzCache[path] = cacheFile to remoteSize
+            cbzCache.put(path, cacheFile, remoteSize)
             cacheFile
         }
     }
 
     companion object {
-        // Short-lived cache of downloaded CBZ files keyed by storage path. Invalidated when
-        // the remote size changes; entries are cleaned up on JVM exit via deleteOnExit().
-        private val cbzCache = ConcurrentHashMap<String, Pair<File, Long>>()
+        // Bounded cache of CBZ copies downloaded from a remote backend, keyed by storage path and
+        // validated by the remote size. Local backends never touch it.
+        private val cbzCache = RemoteCopyCache()
         private val cbzCacheDir = File(System.getProperty("java.io.tmpdir"), "suwayomi-cbz-cache").apply { mkdirs() }
         private val cacheMutex = Mutex()
     }

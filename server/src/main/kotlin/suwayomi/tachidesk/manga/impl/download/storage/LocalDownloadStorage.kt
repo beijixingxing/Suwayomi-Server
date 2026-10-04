@@ -2,6 +2,7 @@ package suwayomi.tachidesk.manga.impl.download.storage
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import suwayomi.tachidesk.manga.impl.util.storage.FileDeletionHelper
 import java.io.File
 import java.io.FileInputStream
 import java.io.InputStream
@@ -12,14 +13,21 @@ import java.io.InputStream
  * All [DownloadStorage] paths are relative to [rootPath]. This implementation maps them
  * onto real files under [rootPath] and mirrors the behaviour of the legacy `File`-based
  * download logic.
+ *
+ * @param rootPath download root the storage-relative paths are resolved against
+ * @param cleanupRootPath upper bound for [cleanupEmptyParents]; empty parent directories are
+ *   removed up to (but excluding) this directory
  */
 class LocalDownloadStorage(
     private val rootPath: String,
+    private val cleanupRootPath: String = rootPath,
 ) : DownloadStorage {
     private fun resolve(path: String): File {
         val normalized = path.trimStart('/')
         return File(rootPath, normalized)
     }
+
+    override fun localPathOrNull(path: String): File? = resolve(path).takeIf { it.exists() }
 
     override suspend fun exists(path: String): Boolean =
         withContext(Dispatchers.IO) {
@@ -47,7 +55,8 @@ class LocalDownloadStorage(
     override suspend fun deleteFile(path: String): Boolean =
         withContext(Dispatchers.IO) {
             val file = resolve(path)
-            if (file.exists() && file.isFile) file.delete() else false
+            // idempotent: deleting something that is not there is a success
+            if (!file.exists()) true else !file.isFile || file.delete()
         }
 
     override suspend fun fileSize(path: String): Long =
@@ -61,7 +70,8 @@ class LocalDownloadStorage(
             val dir = resolve(dirPath)
             if (!dir.exists() || !dir.isDirectory) return@withContext emptyList()
 
-            dir.listFiles()
+            dir
+                .listFiles()
                 .orEmpty()
                 .map { file ->
                     StorageFile(
@@ -81,19 +91,13 @@ class LocalDownloadStorage(
     override suspend fun deleteDirectory(dirPath: String): Boolean =
         withContext(Dispatchers.IO) {
             val dir = resolve(dirPath)
-            if (!dir.exists() || !dir.isDirectory) return@withContext false
-            dir.deleteRecursively()
+            // idempotent: deleting something that is not there is a success
+            if (!dir.exists()) true else !dir.isDirectory || dir.deleteRecursively()
         }
 
-    override suspend fun move(
-        from: String,
-        to: String,
-    ): Boolean =
+    override suspend fun cleanupEmptyParents(path: String) {
         withContext(Dispatchers.IO) {
-            val source = resolve(from)
-            val target = resolve(to)
-            if (!source.exists()) return@withContext false
-            target.parentFile?.mkdirs()
-            source.renameTo(target)
+            FileDeletionHelper.cleanupParentFoldersFor(resolve(path), cleanupRootPath)
         }
+    }
 }

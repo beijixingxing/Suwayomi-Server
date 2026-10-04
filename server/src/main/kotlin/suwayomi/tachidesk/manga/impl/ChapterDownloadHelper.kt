@@ -10,6 +10,7 @@ import suwayomi.tachidesk.manga.impl.download.fileProvider.impl.ArchiveProvider
 import suwayomi.tachidesk.manga.impl.download.fileProvider.impl.FolderProvider
 import suwayomi.tachidesk.manga.impl.download.model.DownloadQueueItem
 import suwayomi.tachidesk.manga.impl.download.storage.DownloadStorageFactory
+import suwayomi.tachidesk.manga.impl.download.storage.LocalDownloadStorage
 import suwayomi.tachidesk.manga.impl.download.storage.StoragePaths
 import suwayomi.tachidesk.manga.impl.util.getChapterCbzPath
 import suwayomi.tachidesk.manga.impl.util.getChapterDownloadPath
@@ -25,6 +26,7 @@ import java.io.InputStream
 
 object ChapterDownloadHelper {
     private val applicationDirs: ApplicationDirs by injectLazy()
+
     suspend fun getImage(
         mangaId: Int,
         chapterId: Int,
@@ -62,9 +64,25 @@ object ChapterDownloadHelper {
         val cbzPath = StoragePaths.toStorageRelative(getChapterCbzPath(mangaId, chapterId), applicationDirs.downloadsRoot)
         val folderPath = StoragePaths.toStorageRelative(getChapterDownloadPath(mangaId, chapterId), applicationDirs.downloadsRoot)
 
-        if (storage.exists(cbzPath)) return ArchiveProvider(mangaId, chapterId, storage)
-        if (!storage.exists(folderPath) && serverConfig.downloadAsCbz.value) return ArchiveProvider(mangaId, chapterId, storage)
-        return FolderProvider(mangaId, chapterId, storage)
+        // 1) content stored by the active backend
+        if (storage.exists(cbzPath)) return ArchiveProvider(mangaId, chapterId, storage, storage)
+        if (storage.exists(folderPath)) return FolderProvider(mangaId, chapterId, storage, storage)
+
+        // 2) content left behind by a previously selected backend — switching the storage type must
+        //    not make already downloaded chapters unreadable. Reads come from the local files, while
+        //    writes (re-downloads) keep targeting the active backend.
+        if (storage !is LocalDownloadStorage) {
+            val local = DownloadStorageFactory.localStorage()
+            if (local.exists(cbzPath)) return ArchiveProvider(mangaId, chapterId, storage, local)
+            if (local.exists(folderPath)) return FolderProvider(mangaId, chapterId, storage, local)
+        }
+
+        // 3) nothing downloaded yet — pick the provider matching the configured target format
+        return if (serverConfig.downloadAsCbz.value) {
+            ArchiveProvider(mangaId, chapterId, storage, storage)
+        } else {
+            FolderProvider(mangaId, chapterId, storage, storage)
+        }
     }
 
     suspend fun getArchiveStreamWithSize(

@@ -49,17 +49,20 @@
 
 ```kotlin
 interface DownloadStorage {
-    suspend fun exists(path: String): Boolean           // 文件/目录是否存在
-    suspend fun writeFile(path, content, size)          // 写入文件
-    suspend fun readFile(path: String): InputStream?    // 读取文件
-    suspend fun deleteFile(path: String): Boolean       // 删除文件
-    suspend fun fileSize(path: String): Long            // 获取文件大小
-    suspend fun listFiles(dirPath): List<StorageFile>   // 列出目录内容
-    suspend fun createDirectory(dirPath: String)        // 创建目录（含父目录）
-    suspend fun deleteDirectory(dirPath): Boolean       // 递归删除目录
-    suspend fun move(from, to): Boolean                 // 移动/重命名
+    suspend fun exists(path: String): Boolean              // 文件/目录是否存在
+    suspend fun writeFile(path, content, size)             // 写入文件
+    suspend fun readFile(path: String): InputStream?       // 读取文件
+    suspend fun deleteFile(path: String): Boolean          // 删除文件（幂等：缺失即成功）
+    suspend fun fileSize(path: String): Long               // 获取文件大小
+    suspend fun listFiles(dirPath): List<StorageFile>      // 列出目录内容
+    suspend fun createDirectory(dirPath: String)           // 创建目录（含父目录）
+    suspend fun deleteDirectory(dirPath: String): Boolean  // 递归删除目录（幂等）
+    fun localPathOrNull(path: String): File?               // 本地后端可直接访问的路径，否则 null
+    suspend fun cleanupEmptyParents(path: String)          // 删除后清理空的父目录（仅本地实现）
 }
 ```
+
+`localPathOrNull()` 是可选能力：本地后端返回真实路径，使读取可以**零拷贝**直接进行；远程后端返回 `null`，调用方改走有界缓存。`cleanupEmptyParents()` 让本地后端在删除章节后清理空的漫画/源目录。
 
 #### `LocalDownloadStorage.kt`
 `server/src/main/kotlin/.../download/storage/LocalDownloadStorage.kt`
@@ -74,14 +77,15 @@ interface DownloadStorage {
 | 方法 | WebDAV 动词 | 说明 |
 |------|------------|------|
 | `exists()` | `HEAD` | 2xx 返回 `true` |
-| `writeFile()` | `PUT` | 自动通过 `MKCOL` 创建父目录；`contentLength` 带断言校验 |
-| `readFile()` | `GET` | 返回原始 `InputStream`，由调用方关闭 |
-| `deleteFile()` | `DELETE` | |
+| `writeFile()` | `PUT` | 通过 `MKCOL` 确保父目录存在（已创建的目录会被记住，避免每次上传重复探测）；`contentLength` 带断言校验 |
+| `readFile()` | `GET` | 返回原始 `InputStream`，由调用方关闭；404 返回 `null`，其他非 2xx 抛出 `IOException`（不再把服务器错误伪装成「文件不存在」） |
+| `deleteFile()` | `DELETE` | 404 视为成功（幂等） |
 | `fileSize()` | `HEAD` | 读取 `Content-Length` 响应头 |
 | `listFiles()` | `PROPFIND` Depth:1 | 正则解析 XML（同时支持 `<D:response>` 和 `<response>`） |
 | `createDirectory()` | `MKCOL` | 逐段遍历路径创建缺失层级；接受 405（已存在），其他错误传播 |
-| `deleteDirectory()` | `DELETE` | 先 `listFiles()` 递归列出子项并删除，再 `DELETE` 目录本身 |
-| `move()` | `MOVE` | |
+| `deleteDirectory()` | `DELETE` | 先 `listFiles()` 递归列出子项并删除，再 `DELETE` 目录本身；404 视为成功 |
+
+> `MOVE` 未实现：`DownloadStorage.move()` 因无任何调用方已被移除（死代码清理）。
 
 URL 构造使用逐段 `URLEncoder.encode()` 处理中日韩字符和特殊符号。
 
@@ -93,18 +97,25 @@ URL 构造使用逐段 `URLEncoder.encode()` 处理中日韩字符和特殊符�
 ```kotlin
 object DownloadStorageFactory {
     fun create(): DownloadStorage = when (serverConfig.downloadStorageType.value) {
-        DownloadStorageType.LOCAL  -> LocalDownloadStorage(serverConfig.downloadsPath.value)
-        DownloadStorageType.WEBDAV -> getWebDav()
+        DownloadStorageType.LOCAL  -> localStorage()
+        DownloadStorageType.WEBDAV -> getWebDav() ?: localStorage()   // 未配置 URL 时回退本地
     }
 }
 ```
 
 工厂方法对 `WebDavDownloadStorage` 实例做了缓存：当 WebDAV 配置（URL、用户名、密码、远程路径）发生变化时，通过 `WebDavConfig` 数据类比对自动失效并重建。
 
+本地后端统一使用 `ApplicationDirs.downloadsRoot`（已包含 `downloadsPath` 为空时的默认值回退），并以 `mangaDownloadsRoot` 作为空父目录清理的上界。此外，工厂额外提供 `localStorage()` 供 `provider()` 做跨后端读取回退。
+
 #### `StoragePaths.kt`
 `server/src/main/kotlin/.../download/storage/StoragePaths.kt`
 
-将本地绝对路径（如 `/comics/mangas/源名/漫画/章节.cbz`）转换为存储相对路径（`mangas/源名/漫画/章节.cbz`），通过剥离 `downloadsRoot` 前缀实现。
+将本地绝对路径（如 `/comics/mangas/源名/漫画/章节.cbz`）转换为存储相对路径（`mangas/源名/漫画/章节.cbz`），通过剥离 `downloadsRoot` 前缀实现。若路径不在下载根下，记录 WARN 后按根相对路径处理，避免静默把宿主机绝对路径泄漏到 WebDAV URL 中。
+
+#### `RemoteCopyCache.kt`
+`server/src/main/kotlin/.../download/storage/RemoteCopyCache.kt`
+
+远程后端无法就地读取，内容需先落到本地临时区。该类是**有界** LRU 缓存：按签名（远端大小 / 页数与总字节）校验有效性，超出条数上限时淘汰最久未使用的条目并删除其文件，避免长跑服务器把磁盘写满。本地后端不会使用它。
 
 #### `DownloadStorageType.kt`
 `server/server-config/.../graphql/types/DownloadStorageType.kt`
@@ -234,8 +245,31 @@ server.webdavRemotePath   = "漫画"
 | 8 | WebDAV 模式下 UI 仍显示「下载位置」设置项 | `TextSetting` 未根据存储类型做条件渲染 | 包裹为 `{storageType === DownloadStorageType.Local && (...)}` |
 | 9 | `listFiles()` 返回空列表，导致无法删除/阅读 WebDAV 文件夹章节 | `parsePropfind` 正则 `<response>` / `<href>` 不匹配标准 WebDAV `DAV:` 命名空间（`<D:response>` / `<D:href>`） | 正则改为 `<(?:D:)?response>` 格式，同时匹配命名空间和非命名空间 XML |
 | 10 | MKCOL 权限错误（403）被静默吞掉，`createDirectory` 返回成功但目录未创建 | `catch (e: Exception)` 吞掉了所有异常（含真正的权限/服务器错误） | 移除 try-catch，只在内层 `execute().use{}` 中接受 2xx / 405，其他异常自然传播 |
-| 11 | `getAsArchiveStream` 下载的临时 CBZ 文件永不删除 | 返回 `localCbz.inputStream()` 后无清理逻辑 | CBZ 本地缓存方案接管文件生命周期，缓存文件通过 `deleteOnExit()` 及 remote-size 失效机制管理 |
+| 11 | `getAsArchiveStream` 下载的临时 CBZ 文件永不删除 | 返回 `localCbz.inputStream()` 后无清理逻辑 | 改为有界缓存 `RemoteCopyCache`（LRU 淘汰并删除文件），不再依赖 `deleteOnExit()` |
 | 12 | `DownloadStorageType.from()` 未被任何代码调用 | GraphQL 解析走 `EnumSetting`，不需要手动反序列化 | 删除冗余方法 |
+| 13 | 切换存储后端后，已下载章节全部无法读取 | `provider()` 只查询当前激活的后端，而 `isDownloaded` 是数据库标记、不随切换变化 | `provider()` 增加跨后端回退：激活后端没有内容时改用本地后端**读取**，写入仍指向激活后端 |
+| 14 | LOCAL 文件夹模式每读一页都把整章图片复制到临时目录，且临时目录永不清理（磁盘无限增长） | 为了让 LOCAL 与 WebDAV 共用「先下载到本地」的读路径，牺牲了原本的零拷贝读取 | 接口新增 `localPathOrNull()`；本地后端直接返回真实路径，不再复制。远程后端改用有界缓存 |
+| 15 | LOCAL CBZ 模式同样被复制到 `/tmp`，且缓存无上限 | `downloadCbzToLocal()` 对所有后端都走缓存 | 本地快路径命中真实文件；远程缓存由 `RemoteCopyCache` 限制条数并淘汰 |
+| 16 | 删除不存在的章节从「成功」变为「失败」，且删除后遗留空的漫画/源目录 | `deleteFile()`/`deleteDirectory()` 对缺失目标返回 `false`；`FileDeletionHelper.cleanupParentFoldersFor()` 调用被移除 | 两个后端的删除改为幂等（缺失即成功）；新增 `cleanupEmptyParents()` 钩子恢复空目录清理 |
+| 17 | WEBDAV 模式下 `downloadImpl()` 误判章节已完成，重新下载不会上传到 WebDAV | 读取回退让 `getImageCount()` 找到了旧后端的内容 | 新增 `existsInActiveBackend()`，`downloadImpl()` 按**写入后端**判定是否已完成 |
+| 18 | `downloadsPath` 为空（默认值）时，LOCAL 模式把文件写到进程工作目录而非 `<dataRoot>/downloads` | 工厂使用了原始 `serverConfig.downloadsPath.value` 而不是带默认值回退的 `ApplicationDirs.downloadsRoot` | 工厂统一改用 `ApplicationDirs.downloadsRoot` 与 `mangaDownloadsRoot` |
+| 19 | 选择 WEBDAV 但未填 URL 时，所有下载与读取都抛 `IllegalArgumentException` | `require(config.url.isNotBlank())` 在热路径上抛出 | 未配置 URL 时记录 WARN 并回退本地存储，前端同时给出提示 |
+
+**第 13–19 项为切换功能的完整审查修复**，其中 13 是核心的用户可见缺陷（切换后旧章节无法阅读），14/15 是本次改动引入的 LOCAL 性能与磁盘回归。
+
+---
+
+## 存储层单元测试
+
+`server/src/test/kotlin/suwayomi/tachidesk/manga/impl/download/storage/`
+
+| 测试类 | 用例数 | 覆盖内容 |
+|--------|--------|----------|
+| `StoragePathsTest` | 5 | 下载根前缀剥离、尾部斜杠、Windows 分隔符、根外路径、避免部分前缀误匹配 |
+| `LocalDownloadStorageTest` | 8 | 写入/读回、缺失返回 null、`deleteFile`/`deleteDirectory` 幂等、`listFiles` 相对路径、`localPathOrNull`、空父目录清理 |
+| `RemoteCopyCacheTest` | 6 | 未知键、签名匹配、签名变更失效、文件缺失失效、LRU 淘汰并删除文件、缓存条数上限 |
+
+运行：`./gradlew :server:test --tests "suwayomi.tachidesk.manga.impl.download.storage.*"`
 
 ---
 
@@ -250,6 +284,9 @@ server.webdavRemotePath   = "漫画"
 | 5 | 本地→WebDAV 重复下载 | 文件夹 | 从已有本地目录读取页面，上传至 WebDAV（sourceFolder 回退） |
 | 6 | 本地→WebDAV 重复下载 | CBZ | 从已有本地页面重建 CBZ，上传至 WebDAV（sourceFolder 回退） |
 | 7 | 测试连接按钮 | — | Toast 提示成功/失败及服务器返回信息 |
+| 8 | 切换后阅读旧章节（仅本地存在） | CBZ / 文件夹 | WebDAV 模式下通过本地回退成功读取，页面正常返回 |
+| 9 | 本地读取 | CBZ / 文件夹 | 直接读取真实文件，不产生 `/tmp` 副本 |
+| 10 | WebDAV 未配置 URL | — | 记录 WARN 并回退本地存储，不再抛异常 |
 
 ### 已验证
 

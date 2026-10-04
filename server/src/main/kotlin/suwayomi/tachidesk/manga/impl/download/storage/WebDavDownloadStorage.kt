@@ -15,12 +15,13 @@ import okio.BufferedSink
 import okio.source
 import java.io.IOException
 import java.io.InputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
  * [DownloadStorage] backed by a remote WebDAV server.
  *
- * Implements the WebDAV protocol (MKCOL / PUT / GET / DELETE / PROPFIND / MOVE / HEAD) on top
+ * Implements the WebDAV protocol (MKCOL / PUT / GET / DELETE / PROPFIND / HEAD) on top
  * of the project's existing OkHttp client, so no extra dependencies are required.
  *
  * All [DownloadStorage] paths are relative to [remoteRoot] and are URL-encoded per path segment
@@ -35,7 +36,8 @@ class WebDavDownloadStorage(
     private val logger = KotlinLogging.logger {}
 
     private val client: OkHttpClient =
-        OkHttpClient.Builder()
+        OkHttpClient
+            .Builder()
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
             .writeTimeout(120, TimeUnit.SECONDS)
@@ -43,6 +45,12 @@ class WebDavDownloadStorage(
             .build()
 
     private val authHeader: String = Credentials.basic(username, password)
+
+    /**
+     * Directories already known to exist on the server. WebDAV has no "create parents" verb, so
+     * without this every single file upload would re-probe the whole parent chain with HEAD/MKCOL.
+     */
+    private val ensuredDirectories: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
     private fun urlFor(path: String): String {
         val normalizedRoot = remoteRoot.trim('/')
@@ -53,13 +61,16 @@ class WebDavDownloadStorage(
             fullPath
                 .split('/')
                 .joinToString("/") { segment ->
-                    java.net.URLEncoder.encode(segment, "UTF-8").replace("+", "%20")
+                    java.net.URLEncoder
+                        .encode(segment, "UTF-8")
+                        .replace("+", "%20")
                 }
         return baseUrl.trimEnd('/') + "/" + encoded
     }
 
     private fun newRequest(url: String): Request.Builder =
-        Request.Builder()
+        Request
+            .Builder()
             .url(url)
             .header("Authorization", authHeader)
 
@@ -96,7 +107,7 @@ class WebDavDownloadStorage(
 
         val body: RequestBody =
             object : RequestBody() {
-                override fun contentType(): MediaType? = null
+                override fun contentType(): MediaType? = "application/octet-stream".toMediaType()
 
                 override fun contentLength(): Long {
                     require(size >= 0) { "Content length must be non-negative, got: $size" }
@@ -118,29 +129,34 @@ class WebDavDownloadStorage(
     override suspend fun readFile(path: String): InputStream? {
         val url = urlFor(path)
         val request = newRequest(url).get().build()
-        return try {
-            val response = execute(request)
-            if (response.code == 404) {
-                response.close()
+
+        val response =
+            try {
+                execute(request)
+            } catch (e: Exception) {
+                logger.warn(e) { "WebDAV read failed for $path" }
                 return null
             }
-            if (response.code !in 200..299) {
-                response.close()
-                throw IOException("WebDAV GET failed for $path: HTTP ${response.code}")
-            }
-            // Return the raw stream; the caller is responsible for closing it (which releases the connection).
-            response.body?.byteStream()
-        } catch (e: Exception) {
-            logger.warn(e) { "WebDAV read failed for $path" }
-            null
+
+        if (response.code == 404) {
+            response.close()
+            return null
         }
+        if (response.code !in 200..299) {
+            response.close()
+            // A server error is not "file missing" — surface it instead of masking it as null.
+            throw IOException("WebDAV GET failed for $path: HTTP ${response.code}")
+        }
+
+        // Return the raw stream; the caller is responsible for closing it (which releases the connection).
+        return response.body.byteStream()
     }
 
     override suspend fun deleteFile(path: String): Boolean {
         val url = urlFor(path)
         val request = newRequest(url).delete().build()
         return try {
-            execute(request).use { it.code in 200..299 }
+            execute(request).use { it.code in 200..299 || it.code == 404 }
         } catch (e: Exception) {
             logger.warn(e) { "WebDAV delete failed for $path" }
             false
@@ -169,7 +185,7 @@ class WebDavDownloadStorage(
         return try {
             execute(request).use { response ->
                 if (response.code !in 200..299) return emptyList()
-                val xml = response.body?.string().orEmpty()
+                val xml = response.body.string()
                 parsePropfind(xml, dirPath)
             }
         } catch (e: Exception) {
@@ -180,7 +196,10 @@ class WebDavDownloadStorage(
 
     override suspend fun createDirectory(dirPath: String) {
         // mkcol only creates a single level; create each missing parent first
-        val segments = dirPath.trim('/').split('/').filter { it.isNotEmpty() }
+        val key = dirPath.trim('/')
+        if (key.isEmpty() || ensuredDirectories.contains(key)) return
+
+        val segments = key.split('/').filter { it.isNotEmpty() }
         var current = ""
         for (segment in segments) {
             current = if (current.isEmpty()) segment else "$current/$segment"
@@ -194,6 +213,7 @@ class WebDavDownloadStorage(
                 }
             }
         }
+        ensuredDirectories.add(key)
     }
 
     override suspend fun deleteDirectory(dirPath: String): Boolean {
@@ -209,28 +229,9 @@ class WebDavDownloadStorage(
         val url = urlFor(dirPath)
         val request = newRequest(url).delete().build()
         return try {
-            execute(request).use { it.code in 200..299 }
+            execute(request).use { it.code in 200..299 || it.code == 404 }
         } catch (e: Exception) {
             logger.warn(e) { "WebDAV deleteDirectory failed for $dirPath" }
-            false
-        }
-    }
-
-    override suspend fun move(
-        from: String,
-        to: String,
-    ): Boolean {
-        val fromUrl = urlFor(from)
-        val toUrl = urlFor(to)
-        val request =
-            newRequest(fromUrl)
-                .method("MOVE", null)
-                .header("Destination", toUrl)
-                .build()
-        return try {
-            execute(request).use { it.code in 200..299 }
-        } catch (e: Exception) {
-            logger.warn(e) { "WebDAV move failed from $from to $to" }
             false
         }
     }
@@ -254,7 +255,13 @@ class WebDavDownloadStorage(
             val block = responseBlock.groupValues[1]
             val href = hrefRegex.find(block)?.groupValues?.get(1) ?: continue
             val isCollection = collectionRegex.containsMatchIn(block)
-            val size = contentLengthRegex.find(block)?.groupValues?.get(1)?.toLongOrNull() ?: 0L
+            val size =
+                contentLengthRegex
+                    .find(block)
+                    ?.groupValues
+                    ?.get(1)
+                    ?.toLongOrNull()
+                    ?: 0L
 
             // skip the directory itself (Depth: 1 returns it as first entry)
             val decodedHref = java.net.URLDecoder.decode(href, "UTF-8")
@@ -311,7 +318,6 @@ class WebDavDownloadStorage(
             <?xml version="1.0"?>
             <D:propfind xmlns:D="DAV:">
               <D:prop>
-                <D:displayname/>
                 <D:getcontentlength/>
                 <D:resourcetype/>
               </D:prop>

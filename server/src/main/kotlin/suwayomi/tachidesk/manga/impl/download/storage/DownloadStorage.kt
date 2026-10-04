@@ -1,5 +1,6 @@
 package suwayomi.tachidesk.manga.impl.download.storage
 
+import java.io.File
 import java.io.InputStream
 
 /**
@@ -41,7 +42,7 @@ interface DownloadStorage {
     /** Returns the content of the file at [path], or null if it does not exist. */
     suspend fun readFile(path: String): InputStream?
 
-    /** Deletes the file at [path]. Returns true if it was deleted. */
+    /** Deletes the file at [path]. Returns true when the file is gone (including if it never existed). */
     suspend fun deleteFile(path: String): Boolean
 
     /** Returns the size in bytes of the file at [path], or 0 if it does not exist. */
@@ -55,12 +56,24 @@ interface DownloadStorage {
     /** Creates the directory at [dirPath] (including any missing parents). */
     suspend fun createDirectory(dirPath: String)
 
-    /** Deletes the directory at [dirPath] recursively. Returns true if deleted. */
+    /** Deletes the directory at [dirPath] recursively. Returns true when it is gone. */
     suspend fun deleteDirectory(dirPath: String): Boolean
 
-    /** Moves/renames an entry from [from] to [to]. Returns true on success. */
-    suspend fun move(
-        from: String,
-        to: String,
-    ): Boolean
+    // ---- optional backend capabilities ----
+
+    /**
+     * Returns the local filesystem [File] backing [path] when this backend stores data on the
+     * local filesystem, or `null` for remote backends.
+     *
+     * Callers use this to read local content in place instead of copying it through a temporary
+     * file, which keeps local downloads on the same zero-copy path they had before remote
+     * backends existed.
+     */
+    fun localPathOrNull(path: String): File? = null
+
+    /**
+     * Called after [path] has been removed. Backends may use this to clean up left-over empty
+     * parent directories (the local backend does; remote backends generally cannot).
+     */
+    suspend fun cleanupEmptyParents(path: String) = Unit
 }
