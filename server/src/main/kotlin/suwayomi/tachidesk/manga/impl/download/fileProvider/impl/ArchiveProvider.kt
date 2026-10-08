@@ -69,7 +69,16 @@ class ArchiveProvider(
     override suspend fun handleSuccessfulDownload() {
         val mangaDownloadFolder = File(getMangaDownloadDir(mangaId))
         val chapterCacheFolder = File(getChapterCachePath(mangaId, chapterId))
-        val sourceFolder = resolveSourceFolder()
+        val chapterDownloadFolder = File(getChapterDownloadPath(mangaId, chapterId))
+
+        // Chapter files can live in two places at this point: freshly downloaded pages and the
+        // freshly written ComicInfo.xml in the cache folder, and pages extracted from a previous
+        // download (see [extractExistingDownload]) or left over from a folder-mode download in
+        // the final download folder. Both must end up in the archive; on name conflicts the
+        // cache copy wins because it is the newer file.
+        val cacheFiles = chapterCacheFolder.listFiles().orEmpty().associateBy { it.name }
+        val downloadFiles = chapterDownloadFolder.listFiles().orEmpty().associateBy { it.name }
+        val sourceFiles = (downloadFiles + cacheFiles).values.sortedBy { it.name }
 
         // build the CBZ in a local temp file, then upload to the storage backend
         val tempCbz = File.createTempFile("suwayomi-cbz-", ".cbz")
@@ -79,18 +88,16 @@ class ArchiveProvider(
                 ZipArchiveOutputStream(tempCbz.outputStream()).use { zipOut ->
                     zipOut.setMethod(ZipArchiveOutputStream.DEFLATED)
                     zipOut.setLevel(Deflater.DEFAULT_COMPRESSION)
-                    if (sourceFolder != null) {
-                        sourceFolder.listFiles()?.sortedBy { it.name }?.forEach {
-                            val entry = ZipArchiveEntry(it.name)
-                            entry.time = 0L
-                            try {
-                                zipOut.putArchiveEntry(entry)
-                                it.inputStream().use { inputStream ->
-                                    inputStream.copyTo(zipOut)
-                                }
-                            } finally {
-                                zipOut.closeArchiveEntry()
+                    sourceFiles.forEach {
+                        val entry = ZipArchiveEntry(it.name)
+                        entry.time = 0L
+                        try {
+                            zipOut.putArchiveEntry(entry)
+                            it.inputStream().use { inputStream ->
+                                inputStream.copyTo(zipOut)
                             }
+                        } finally {
+                            zipOut.closeArchiveEntry()
                         }
                     }
                 }
@@ -111,9 +118,21 @@ class ArchiveProvider(
 
     override suspend fun delete(): Boolean {
         val path = cbzStoragePath()
-        val deleted = storage.deleteFile(path)
+        // Delete from the backend the chapter is actually read from as well — it differs from
+        // [storage] for chapters downloaded through a previous storage type, and deleting only
+        // from the active backend would leave the old copy behind as an orphan.
+        val deletedFromActive = storage.deleteFile(path)
+        val deleted =
+            if (readStorage === storage) {
+                deletedFromActive
+            } else {
+                deletedFromActive && readStorage.deleteFile(path)
+            }
         if (deleted) {
             storage.cleanupEmptyParents(path)
+            if (readStorage !== storage) {
+                readStorage.cleanupEmptyParents(path)
+            }
             transaction {
                 ChapterUserTable.update({ ChapterUserTable.chapter eq chapterId }) {
                     it[koreaderHash] = null

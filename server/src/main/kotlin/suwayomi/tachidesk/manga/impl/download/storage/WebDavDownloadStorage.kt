@@ -35,14 +35,10 @@ class WebDavDownloadStorage(
 ) : DownloadStorage {
     private val logger = KotlinLogging.logger {}
 
-    private val client: OkHttpClient =
-        OkHttpClient
-            .Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(120, TimeUnit.SECONDS)
-            .writeTimeout(120, TimeUnit.SECONDS)
-            .callTimeout(300, TimeUnit.SECONDS)
-            .build()
+    // Shared across instances: the factory creates a new backend whenever the WebDAV settings
+    // change, and every OkHttpClient owns a dispatcher thread pool and connection pool that are
+    // never released — a per-instance client would leak both on every settings change.
+    private val client: OkHttpClient = SHARED_CLIENT
 
     private val authHeader: String = Credentials.basic(username, password)
 
@@ -120,6 +116,14 @@ class WebDavDownloadStorage(
             }
         val request = newRequest(url).put(body).build()
         execute(request).use { response ->
+            if (response.code == 409) {
+                // 409 Conflict: a parent directory vanished since it was memoized (deleted by
+                // another client or on the server). Forget everything we know about existing
+                // directories so the next attempt re-creates them. The request body may already
+                // be consumed, so the upload cannot be retried in place.
+                ensuredDirectories.clear()
+                throw IOException("WebDAV PUT failed for $path: HTTP 409 (parent directory missing, directory cache was reset)")
+            }
             if (response.code !in 200..299) {
                 throw IOException("WebDAV PUT failed for $path: HTTP ${response.code}")
             }
@@ -228,12 +232,23 @@ class WebDavDownloadStorage(
         }
         val url = urlFor(dirPath)
         val request = newRequest(url).delete().build()
-        return try {
-            execute(request).use { it.code in 200..299 || it.code == 404 }
-        } catch (e: Exception) {
-            logger.warn(e) { "WebDAV deleteDirectory failed for $dirPath" }
-            false
+        val deleted =
+            try {
+                execute(request).use { it.code in 200..299 || it.code == 404 }
+            } catch (e: Exception) {
+                logger.warn(e) { "WebDAV deleteDirectory failed for $dirPath" }
+                false
+            }
+        if (deleted) {
+            // The directory — and with it every memoized descendant — no longer exists on the
+            // server. Forget them, otherwise a later createDirectory would skip the MKCOL for a
+            // path that is gone and uploads below it would fail with 409.
+            val key = dirPath.trim('/')
+            if (key.isNotEmpty()) {
+                ensuredDirectories.removeIf { it == key || it.startsWith("$key/") }
+            }
         }
+        return deleted
     }
 
     private fun parsePropfind(
@@ -241,15 +256,18 @@ class WebDavDownloadStorage(
         dirPath: String,
     ): List<StorageFile> {
         val files = mutableListOf<StorageFile>()
-        // Regex-based parsing handles both namespaced (<D:response xmlns:D="DAV:">) and
-        // plain (<response>) WebDAV responses. Future improvement: switch to a DOM parser
-        // (javax.xml.parsers.DocumentBuilderFactory is already available in the project).
-        val responseRegex = Regex("<(?:D:)?response>(.*?)</(?:D:)?response>", RegexOption.DOT_MATCHES_ALL)
-        val hrefRegex = Regex("<(?:D:)?href>(.*?)</(?:D:)?href>", RegexOption.DOT_MATCHES_ALL)
+        // Regex-based parsing handles namespaced and plain WebDAV responses alike. The namespace
+        // prefix is arbitrary — servers use `D:`, `d:` (Nextcloud/ownCloud) or other prefixes for
+        // the same `DAV:` namespace, so any single-segment prefix is matched.
+        // Future improvement: switch to a DOM parser (javax.xml.parsers.DocumentBuilderFactory
+        // is already available in the project).
+        val prefix = "(?:[A-Za-z][A-Za-z0-9]*:)?"
+        val responseRegex = Regex("<${prefix}response>(.*?)</${prefix}response>", RegexOption.DOT_MATCHES_ALL)
+        val hrefRegex = Regex("<${prefix}href>(.*?)</${prefix}href>", RegexOption.DOT_MATCHES_ALL)
         // <D:collection/> or <D:collection xmlns:D="DAV:"/> or <collection/>
-        val collectionRegex = Regex("<(?:D:)?collection[^/>]*/>")
+        val collectionRegex = Regex("<${prefix}collection[^/>]*/>")
         val contentLengthRegex =
-            Regex("<(?:D:)?getcontentlength>(.*?)</(?:D:)?getcontentlength>", RegexOption.DOT_MATCHES_ALL)
+            Regex("<${prefix}getcontentlength>(.*?)</${prefix}getcontentlength>", RegexOption.DOT_MATCHES_ALL)
 
         for (responseBlock in responseRegex.findAll(xml)) {
             val block = responseBlock.groupValues[1]
@@ -263,8 +281,10 @@ class WebDavDownloadStorage(
                     ?.toLongOrNull()
                     ?: 0L
 
-            // skip the directory itself (Depth: 1 returns it as first entry)
-            val decodedHref = java.net.URLDecoder.decode(href, "UTF-8")
+            // skip the directory itself (Depth: 1 returns it as first entry).
+            // URLDecoder.decode would also turn a literal '+' into a space (query-string
+            // semantics); escaping '+' first keeps path semantics.
+            val decodedHref = java.net.URLDecoder.decode(href.replace("+", "%2B"), "UTF-8")
             val relPath = relativePathFromHref(decodedHref, dirPath) ?: continue
 
             files.add(
@@ -313,6 +333,15 @@ class WebDavDownloadStorage(
     }
 
     companion object {
+        private val SHARED_CLIENT: OkHttpClient =
+            OkHttpClient
+                .Builder()
+                .connectTimeout(30, TimeUnit.SECONDS)
+                .readTimeout(120, TimeUnit.SECONDS)
+                .writeTimeout(120, TimeUnit.SECONDS)
+                .callTimeout(300, TimeUnit.SECONDS)
+                .build()
+
         private val PROPFIND_REQUEST_BODY =
             """
             <?xml version="1.0"?>

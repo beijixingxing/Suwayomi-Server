@@ -108,25 +108,6 @@ abstract class ChaptersFilesProvider<Type : FileType>(
      */
     protected abstract suspend fun existsInActiveBackend(): Boolean
 
-    /**
-     * Resolves the folder containing chapter pages, preferring the download cache and falling back
-     * to the local download directory.
-     *
-     * The download queue skips pages that already exist in the local final-download folder
-     * (see [downloadImpl]), so re-downloading a chapter that was previously stored locally may
-     * leave the cache folder empty. This method returns [getChapterDownloadPath] when the cache is
-     * empty but the local download directory still holds the pages, so the storage backend still
-     * receives the files.
-     */
-    protected suspend fun resolveSourceFolder(): File? {
-        val cacheFolder = File(getChapterCachePath(mangaId, chapterId))
-        if (cacheFolder.isDirectory && cacheFolder.listFiles()?.isNotEmpty() == true) {
-            return cacheFolder
-        }
-        return File(getChapterDownloadPath(mangaId, chapterId))
-            .takeIf { it.isDirectory && it.listFiles()?.isNotEmpty() == true }
-    }
-
     @OptIn(FlowPreview::class)
     private suspend fun downloadImpl(
         download: DownloadQueueItem,

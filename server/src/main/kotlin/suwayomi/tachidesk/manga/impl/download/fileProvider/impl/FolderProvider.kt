@@ -14,6 +14,7 @@ import suwayomi.tachidesk.manga.impl.download.fileProvider.FileType.RegularFile
 import suwayomi.tachidesk.manga.impl.download.storage.DownloadStorage
 import suwayomi.tachidesk.manga.impl.download.storage.RemoteCopyCache
 import suwayomi.tachidesk.manga.impl.download.storage.StoragePaths
+import suwayomi.tachidesk.manga.impl.util.getChapterCachePath
 import suwayomi.tachidesk.manga.impl.util.getChapterDownloadPath
 import suwayomi.tachidesk.manga.model.table.ChapterUserTable
 import suwayomi.tachidesk.server.ApplicationDirs
@@ -66,15 +67,41 @@ class FolderProvider(
     override suspend fun existsInActiveBackend(): Boolean = storage.listFiles(chapterStoragePath()).any { !it.isDirectory }
 
     override suspend fun handleSuccessfulDownload() {
-        val sourceFolder = resolveSourceFolder() ?: return
-        uploadFolderToStorage(sourceFolder, chapterStoragePath())
+        val chapterCacheFolder = File(getChapterCachePath(mangaId, chapterId))
+        val chapterDownloadFolder = File(getChapterDownloadPath(mangaId, chapterId))
+
+        // The download queue skips pages that already exist in the final download folder (see
+        // [downloadImpl]), so re-downloading a chapter whose previous content was extracted there
+        // (see [extractExistingDownload]) leaves those pages outside the cache folder. Copy them
+        // into the cache first so the upload sees the complete chapter; files already present in
+        // the cache (the newer downloads and the freshly written ComicInfo.xml) are kept.
+        val cacheNames = chapterCacheFolder.listFiles().orEmpty().mapTo(mutableSetOf()) { it.name }
+        chapterDownloadFolder
+            .listFiles()
+            .orEmpty()
+            .filter { it.isFile && it.name !in cacheNames }
+            .forEach { file -> file.copyTo(File(chapterCacheFolder, file.name)) }
+
+        uploadFolderToStorage(chapterCacheFolder, chapterStoragePath())
     }
 
     override suspend fun delete(): Boolean {
         val path = chapterStoragePath()
-        val deleted = storage.deleteDirectory(path)
+        // Delete from the backend the chapter is actually read from as well — it differs from
+        // [storage] for chapters downloaded through a previous storage type, and deleting only
+        // from the active backend would leave the old copy behind as an orphan.
+        val deletedFromActive = storage.deleteDirectory(path)
+        val deleted =
+            if (readStorage === storage) {
+                deletedFromActive
+            } else {
+                deletedFromActive && readStorage.deleteDirectory(path)
+            }
         if (deleted) {
             storage.cleanupEmptyParents(path)
+            if (readStorage !== storage) {
+                readStorage.cleanupEmptyParents(path)
+            }
             transaction {
                 ChapterUserTable.update({ ChapterUserTable.chapter eq chapterId }) {
                     it[koreaderHash] = null
