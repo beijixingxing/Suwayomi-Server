@@ -132,9 +132,9 @@ GraphQL 解析由 `EnumSetting` 处理，无需手动反序列化方法。
 |------|----------|
 | `ServerConfig.kt` | 在 `DOWNLOADER` 组下新增 5 个设置项（proto 编号 99–103）：`downloadStorageType`（枚举）、`webdavUrl`、`webdavUsername`、`webdavPassword`、`webdavRemotePath`（字符串）。密码类配置标记为不参与备份。 |
 | `ChapterDownloadHelper.kt` | 统一 `provider()` 为单一路径，将解析后的 `DownloadStorage` 实例传递给 `ArchiveProvider` 和 `FolderProvider`。文件存在性检查改用 `storage.exists()`。 |
-| `ChaptersFilesProvider.kt` | 新增 `resolveSourceFolder()` 受保护方法：优先返回页面缓存目录，缓存为空时回退到本地下载目录。 |
-| `ArchiveProvider.kt` | 构造函数接受 `DownloadStorage`；`handleSuccessfulDownload()` 先在临时文件构建 CBZ，再通过 `storage.writeFile()` 上传；CBZ 本地缓存（`ConcurrentHashMap` + `Mutex`）避免阅读时逐页重复下载整个压缩包。 |
-| `FolderProvider.kt` | 构造函数接受 `DownloadStorage`；`handleSuccessfulDownload()` 递归上传页面缓存到存储后端。 |
+| `ChaptersFilesProvider.kt` | 下载主流程：按**写入后端**判定章节是否已存在（`existsInActiveBackend()`），页循环跳过最终目录与缓存中已有的页面，成功后调用 Provider 的 `handleSuccessfulDownload()` 上传。 |
+| `ArchiveProvider.kt` | 构造函数接受 `DownloadStorage`（写入后端）与可选的读取后端；`handleSuccessfulDownload()` 合并**最终目录中已存在的页面**与**下载缓存**（缓存同名文件优先）后在临时文件构建 CBZ，再通过 `storage.writeFile()` 上传；`delete()` 同时从写入与读取两个后端删除；CBZ 本地缓存（`ConcurrentHashMap` + `Mutex`）避免阅读时逐页重复下载整个压缩包。 |
+| `FolderProvider.kt` | 构造函数接受 `DownloadStorage`（写入后端）与可选的读取后端；`handleSuccessfulDownload()` 把最终目录中缓存缺少的页面补进缓存后递归上传；`delete()` 同时从写入与读取两个后端删除。 |
 | `TachideskGraphQLSchema.kt` | 注册 `WebDavConnectionMutation` 为顶层 GraphQL 对象。 |
 | `Constants.kt` | 为自定义构建硬编码 `getTachideskVersion` 和 `getTachideskRevision`。 |
 
@@ -236,7 +236,7 @@ server.webdavRemotePath   = "漫画"
 | # | 症状 | 根因 | 修复方式 |
 |---|------|------|----------|
 | 1 | CBZ 流在调用方读取前已关闭 | `readFile()` 使用了 `execute(request).use{}`，导致 Response 及其流立即关闭 | 移除 `.use{}`，返回原始 `InputStream`，由调用方负责关闭 |
-| 2 | 从本地切换到 WebDAV 重复下载章节时静默无输出 | `downloadImpl()` 检测到本地 `finalDownloadFolder` 已有页面文件后跳过下载，缓存为空，`handleSuccessfulDownload()` 直接返回 | 在 `ChaptersFilesProvider` 中增加 `resolveSourceFolder()` 回退方法：缓存为空时从本地下载目录读取文件上传 |
+| 2 | 从本地切换到 WebDAV 重复下载章节时静默无输出 | `downloadImpl()` 检测到本地 `finalDownloadFolder` 已有页面文件后跳过下载，缓存为空，`handleSuccessfulDownload()` 无内容可上传 | Provider 的 `handleSuccessfulDownload()` 合并最终目录与缓存两处内容（见第 20 项） |
 | 3 | Factory 缓存的 WebDAV 实例永不失效 | 缓存实例不随配置变化而更新 | 新增 `WebDavConfig` 数据类比对，配置变更时自动重建 |
 | 4 | WebDAV 上 `deleteDirectory()` 非递归删除失败 | `DELETE` 对非空 WebDAV 集合返回 409 | 改为递归删除：先 `listFiles()` 列出子项 → 逐个删除 → 最后 `DELETE` 目录本身 |
 | 5 | 每次 404 预检查都产生 WARN 级别堆栈日志 | OkHttp 的项目级 `Call.await()` 扩展对**所有**非 2xx 响应抛出异常 | 替换为原生阻塞 `client.newCall(request).execute()`，404 作为普通响应返回不抛异常 |
@@ -254,8 +254,14 @@ server.webdavRemotePath   = "漫画"
 | 17 | WEBDAV 模式下 `downloadImpl()` 误判章节已完成，重新下载不会上传到 WebDAV | 读取回退让 `getImageCount()` 找到了旧后端的内容 | 新增 `existsInActiveBackend()`，`downloadImpl()` 按**写入后端**判定是否已完成 |
 | 18 | `downloadsPath` 为空（默认值）时，LOCAL 模式把文件写到进程工作目录而非 `<dataRoot>/downloads` | 工厂使用了原始 `serverConfig.downloadsPath.value` 而不是带默认值回退的 `ApplicationDirs.downloadsRoot` | 工厂统一改用 `ApplicationDirs.downloadsRoot` 与 `mangaDownloadsRoot` |
 | 19 | 选择 WEBDAV 但未填 URL 时，所有下载与读取都抛 `IllegalArgumentException` | `require(config.url.isNotBlank())` 在热路径上抛出 | 未配置 URL 时记录 WARN 并回退本地存储，前端同时给出提示 |
+| 20 | 迁移/部分重下载场景上传的 CBZ 只有 ComicInfo.xml 没有页面（或文件夹模式丢失已有页面） | `handleSuccessfulDownload()` 只上传下载缓存；页循环跳过的页面留在最终目录里，不在缓存中 | 两个 Provider 的 `handleSuccessfulDownload()` 合并最终目录与缓存：ArchiveProvider 合并两处文件打包 CBZ，FolderProvider 把最终目录缺少的页面补进缓存再上传；同名冲突时缓存（较新）优先 |
+| 21 | 切换存储后端后重新下载章节，旧后端的内容成为孤儿文件 | Provider 的 `delete()` 只从写入后端删除 | `delete()` 在读取后端与写入后端不同时同时删除两处，并各自清理空父目录 |
+| 22 | WebDAV 服务器端目录被外部删除后，上传因 409 失败且目录缓存永不恢复 | `writeFile()` 遇 409 直接抛异常，`ensuredDirectories` 备忘录仍认为目录存在 | 409 时清空目录备忘录并抛出可读异常，下载器重试时自动重建目录；`deleteDirectory()` 同步移除被删目录的子目录备忘 |
+| 23 | 部分服务器（如 Alist）返回大写 `D:` 命名空间的 PROPFIND，解析为空 | 正则只匹配小写 `d:` 前缀 | 正则改为 `<(?:[A-Za-z][A-Za-z0-9]*:)?response>` 形式，任意前缀与无前缀均匹配 |
+| 24 | 文件名含 `+` 时 WebDAV href 解析后 `+` 变成空格 | `URLDecoder.decode` 把 `+` 当作编码的空格 | 解码前把字面 `+` 替换为 `%2B` |
+| 25 | 每次创建 `WebDavDownloadStorage` 实例都新建一个 `OkHttpClient`（线程池泄漏） | 实例级 client 随配置变更不断创建 | 共享 companion 级 `SHARED_CLIENT`，实例复用 |
 
-**第 13–19 项为切换功能的完整审查修复**，其中 13 是核心的用户可见缺陷（切换后旧章节无法阅读），14/15 是本次改动引入的 LOCAL 性能与磁盘回归。
+**第 13–19 项为切换功能的完整审查修复**，其中 13 是核心的用户可见缺陷（切换后旧章节无法阅读），14/15 是本次改动引入的 LOCAL 性能与磁盘回归。**第 20–25 项为第二轮审查（F1–F6）修复**：20/21 修复迁移与双后端删除的数据完整性缺陷，22–24 修复 WebDAV 协议兼容性，25 修复资源泄漏。
 
 ---
 
@@ -268,6 +274,8 @@ server.webdavRemotePath   = "漫画"
 | `StoragePathsTest` | 5 | 下载根前缀剥离、尾部斜杠、Windows 分隔符、根外路径、避免部分前缀误匹配 |
 | `LocalDownloadStorageTest` | 8 | 写入/读回、缺失返回 null、`deleteFile`/`deleteDirectory` 幂等、`listFiles` 相对路径、`localPathOrNull`、空父目录清理 |
 | `RemoteCopyCacheTest` | 6 | 未知键、签名匹配、签名变更失效、文件缺失失效、LRU 淘汰并删除文件、缓存条数上限 |
+| `WebDavDownloadStorageTest` | 6 | MockWebServer 驱动：小写/无前缀命名空间 PROPFIND 解析、文件名 `+` 保留、目录删除后重建（备忘录失效）、409 后目录缓存重置、PUT 上传内容 |
+| `ProviderDownloadTest` | 5 | 以真实 `download()` 入口驱动：迁移场景合并上传（CBZ 与文件夹两种模式）、同名冲突缓存优先、双后端删除 |
 
 运行：`./gradlew :server:test --tests "suwayomi.tachidesk.manga.impl.download.storage.*"`
 
@@ -281,8 +289,8 @@ server.webdavRemotePath   = "漫画"
 | 2 | 本地 | 文件夹 | `章节/` 目录及逐页图片写入 `downloadsPath/mangas/...` |
 | 3 | WebDAV | CBZ | `.cbz` 文件上传至 `<webdavUrl>/<remotePath>/mangas/...` |
 | 4 | WebDAV | 文件夹 | `章节/` 目录及逐页图片通过 MKCOL+PUT 上传 |
-| 5 | 本地→WebDAV 重复下载 | 文件夹 | 从已有本地目录读取页面，上传至 WebDAV（sourceFolder 回退） |
-| 6 | 本地→WebDAV 重复下载 | CBZ | 从已有本地页面重建 CBZ，上传至 WebDAV（sourceFolder 回退） |
+| 5 | 本地→WebDAV 重复下载 | 文件夹 | 合并最终目录已有页面与缓存后上传至 WebDAV |
+| 6 | 本地→WebDAV 重复下载 | CBZ | 合并最终目录已有页面与缓存重建 CBZ，上传至 WebDAV |
 | 7 | 测试连接按钮 | — | Toast 提示成功/失败及服务器返回信息 |
 | 8 | 切换后阅读旧章节（仅本地存在） | CBZ / 文件夹 | WebDAV 模式下通过本地回退成功读取，页面正常返回 |
 | 9 | 本地读取 | CBZ / 文件夹 | 直接读取真实文件，不产生 `/tmp` 副本 |
@@ -294,6 +302,8 @@ server.webdavRemotePath   = "漫画"
 - WebDAV 文件夹模式（非 CBZ）下载正常完成——页面成功上传，服务器端脚本自动打包为 `.cbz`。
 - 本地 ↔ WebDAV 切换在 CBZ 和文件夹两种模式下均正常。
 - 之前用本地模式下载过的章节重新下载时，正确回退到本地文件并上传至 WebDAV。
+- F1–F6 修复后：338 项单元测试全部通过（含新增 11 项），ktlint 无违规；实机部署验证了读取、删除、完整下载→上传（CBZ 18 页 + ComicInfo）全链路。
+- 已知限制：当 `downloadsPath` 指向 rclone FUSE 挂载（与 WebDAV 服务器是同一存储）时，挂载的目录缓存/VFS 写缓存会让应用看到的「本地」视图与服务器真实状态短暂不一致——合并路径的实机验证因此不可靠，以单元测试为准（见部署注意事项）。
 
 ---
 
