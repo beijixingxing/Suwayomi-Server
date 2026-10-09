@@ -842,6 +842,13 @@ object WebInterfaceManager {
         raiseError: Boolean = false,
     ): Pair<String, Boolean> =
         try {
+            if (flavor == WebUIFlavor.CUSTOM) {
+                // Custom WebUIs are served from user-provided files and have no update
+                // server; the flavor's URL fields are placeholders, not real endpoints.
+                // Requesting them would always fail, so report the local version as current.
+                logger.debug { "isUpdateAvailable: flavor is \"${flavor.uiName}\", no update check possible" }
+                return Pair(currentVersion, false)
+            }
             val isServedWebUIForCurrentFlavor = flavor.uiName == getServedWebUIFlavor().uiName
             val latestCompatibleVersion = getLatestCompatibleVersion(flavor)
             val isVersionUpdateAvailable = latestCompatibleVersion != currentVersion
