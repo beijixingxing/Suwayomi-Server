@@ -303,7 +303,7 @@ server.webdavRemotePath   = "漫画"
 - 本地 ↔ WebDAV 切换在 CBZ 和文件夹两种模式下均正常。
 - 之前用本地模式下载过的章节重新下载时，正确回退到本地文件并上传至 WebDAV。
 - F1–F6 修复后：338 项单元测试全部通过（含新增 11 项），ktlint 无违规；实机部署验证了读取、删除、完整下载→上传（CBZ 18 页 + ComicInfo）全链路。
-- 已知限制：当 `downloadsPath` 指向 rclone FUSE 挂载（与 WebDAV 服务器是同一存储）时，挂载的目录缓存/VFS 写缓存会让应用看到的「本地」视图与服务器真实状态短暂不一致——合并路径的实机验证因此不可靠，以单元测试为准（见部署注意事项）。
+- 部署要点：**`downloadsPath` 不要指向 WebDAV 存储的 rclone FUSE 挂载**（如 `/comics`）——那会让 LOCAL 与 WEBDAV 两种模式实际指向同一存储，且挂载的目录缓存/VFS 写缓存造成「本地」视图与服务器真实状态短暂不一致。保持 `downloadsPath` 为空（默认 `<dataRoot>/downloads`，容器数据卷真实磁盘）即可：LOCAL 写本地磁盘、WEBDAV 走 HTTP，两者独立；切换后端时本地副本作为读取回退与迁移源（合并上传）生效。此配置已实机验证：LOCAL 下载落数据卷、WEBDAV 下载上服务器、本地→WebDAV 迁移重下载（RX≈0、TX=CBZ 全量）、双后端删除均正常。
 
 ---
 
